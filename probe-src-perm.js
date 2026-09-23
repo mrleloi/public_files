@@ -84,18 +84,35 @@ async function login(c, acct, tag) {
   c.s.destroy();
 
   if (process.env.SUB !== '1') { console.log('\n(SUB=1 not set: data-port subscribe test skipped)'); return; }
+  // S253: MODES=plain,mdp (default both). 'mdp' replays MDP's exact UAT data-port sequence
+  // (ice-ctf-client.service.ts on origin/UAT, conflation DEFAULT ON since S127-C4b):
+  //   QueryDepthAndSubscribe -> first SetL2ConflationInterval|2029=<L2_MS, default 200> (tag 90), then the verb with 2035=1
+  //   QuerySnapAndSubscribe  -> first SetConflationInterval|2029=<L1_MS, default 500>   (tag 90), then the verb with 2035=1
+  // Each command's own status is printed, so a -33 is attributed to the exact frame that earned it.
+  const modes = (process.env.MODES || 'plain,mdp').split(',').map((x) => x.trim());
   for (const s of sources) {
     const rt = routes[s];
     if (!rt.port) { console.log(`source ${s}: no data port from GetPort, skip`); continue; }
     const dhost = rt.host || host;
-    for (const verb of ['QueryDepthAndSubscribe', 'QuerySnapAndSubscribe']) {
+    for (const mode of modes) for (const verb of ['QueryDepthAndSubscribe', 'QuerySnapAndSubscribe']) {
       let d;
-      try { d = await conn(dhost, Number(rt.port), `data ${s} ${verb}`); } catch (e) { console.log(`source ${s} ${verb}: connect ${dhost}:${rt.port} failed: ${e.message}`); continue; }
+      const lbl = `data ${s} ${verb} ${mode}`;
+      try { d = await conn(dhost, Number(rt.port), lbl); } catch (e) { console.log(`source ${s} ${verb} ${mode}: connect ${dhost}:${rt.port} failed: ${e.message}`); continue; }
       if (await login(d, acct, 1)) {
-        const r = await cmd(d, { 5022: verb, 5026: 2, 4: s }, 6000);
+        let conf = '';
+        const sub = { 5022: verb, 5026: 2, 4: s };
+        if (mode === 'mdp') {
+          const l2 = verb === 'QueryDepthAndSubscribe';
+          const cverb = l2 ? 'SetL2ConflationInterval' : 'SetConflationInterval';
+          const ms = l2 ? (process.env.L2_MS || '200') : (process.env.L1_MS || '500');
+          const cr = await cmd(d, { 5022: cverb, 5026: 90, 2029: ms }, 6000);
+          conf = ` [${cverb} 2029=${ms} -> 5001=${status(cr)} raw=${cr.frames.map(redact).join(' || ').slice(0, 120)}]`;
+          sub[2035] = 1;
+        }
+        const r = await cmd(d, sub, 6000);
         await new Promise((z) => setTimeout(z, 4000));
         const data = d.frames.filter((p) => !/5001=/.test(p)).length;
-        console.log(`source ${s} ${verb} @${dhost}:${rt.port} -> 5001=${status(r)} dataFramesIn4s=${data} first=${(r.frames[0] ? redact(r.frames[0]) : '').slice(0, 200)}`);
+        console.log(`source ${s} ${verb} ${mode}${conf} @${dhost}:${rt.port} -> 5001=${status(r)} dataFramesIn4s=${data} first=${(r.frames[0] ? redact(r.frames[0]) : '').slice(0, 160)}`);
       }
       d.s.destroy();
       await new Promise((z) => setTimeout(z, 1500));
